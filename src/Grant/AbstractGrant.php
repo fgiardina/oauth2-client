@@ -1,80 +1,560 @@
 <?php
 /**
- * This file is part of the league/oauth2-client library
+ * OAuth 2.0 Abstract grant.
  *
- * For the full copyright and license information, please view the LICENSE
- * file that was distributed with this source code.
+ * @author      Alex Bilbie <hello@alexbilbie.com>
+ * @copyright   Copyright (c) Alex Bilbie
+ * @license     http://mit-license.org/
  *
- * @copyright Copyright (c) Alex Bilbie <hello@alexbilbie.com>
- * @license http://opensource.org/licenses/MIT MIT
- * @link http://thephpleague.com/oauth2-client/ Documentation
- * @link https://packagist.org/packages/league/oauth2-client Packagist
- * @link https://github.com/thephpleague/oauth2-client GitHub
+ * @link        https://github.com/thephpleague/oauth2-server
  */
+namespace League\OAuth2\Server\Grant;
 
-namespace League\OAuth2\Client\Grant;
-
-use League\OAuth2\Client\Tool\RequiredParameterTrait;
+use DateInterval;
+use DateTime;
+use Error;
+use Exception;
+use League\Event\EmitterAwareTrait;
+use League\OAuth2\Server\CryptKey;
+use League\OAuth2\Server\CryptTrait;
+use League\OAuth2\Server\Entities\AccessTokenEntityInterface;
+use League\OAuth2\Server\Entities\AuthCodeEntityInterface;
+use League\OAuth2\Server\Entities\ClientEntityInterface;
+use League\OAuth2\Server\Entities\RefreshTokenEntityInterface;
+use League\OAuth2\Server\Entities\ScopeEntityInterface;
+use League\OAuth2\Server\Exception\OAuthServerException;
+use League\OAuth2\Server\Exception\UniqueTokenIdentifierConstraintViolationException;
+use League\OAuth2\Server\Repositories\AccessTokenRepositoryInterface;
+use League\OAuth2\Server\Repositories\AuthCodeRepositoryInterface;
+use League\OAuth2\Server\Repositories\ClientRepositoryInterface;
+use League\OAuth2\Server\Repositories\RefreshTokenRepositoryInterface;
+use League\OAuth2\Server\Repositories\ScopeRepositoryInterface;
+use League\OAuth2\Server\Repositories\UserRepositoryInterface;
+use League\OAuth2\Server\RequestEvent;
+use League\OAuth2\Server\RequestTypes\AuthorizationRequest;
+use LogicException;
+use Psr\Http\Message\ServerRequestInterface;
+use TypeError;
 
 /**
- * Represents a type of authorization grant.
- *
- * An authorization grant is a credential representing the resource
- * owner's authorization (to access its protected resources) used by the
- * client to obtain an access token.  OAuth 2.0 defines four
- * grant types -- authorization code, implicit, resource owner password
- * credentials, and client credentials -- as well as an extensibility
- * mechanism for defining additional types.
- *
- * @link http://tools.ietf.org/html/rfc6749#section-1.3 Authorization Grant (RFC 6749, §1.3)
+ * Abstract grant class.
  */
-abstract class AbstractGrant
+abstract class AbstractGrant implements GrantTypeInterface
 {
-    use RequiredParameterTrait;
+    use EmitterAwareTrait, CryptTrait;
+
+    const SCOPE_DELIMITER_STRING = ' ';
+
+    const MAX_RANDOM_TOKEN_GENERATION_ATTEMPTS = 10;
 
     /**
-     * Returns the name of this grant, eg. 'grant_name', which is used as the
-     * grant type when encoding URL query parameters.
-     *
-     * @return string
+     * @var ClientRepositoryInterface
      */
-    abstract protected function getName();
+    protected $clientRepository;
 
     /**
-     * Returns a list of all required request parameters.
-     *
-     * @return array
+     * @var AccessTokenRepositoryInterface
      */
-    abstract protected function getRequiredRequestParameters();
+    protected $accessTokenRepository;
 
     /**
-     * Returns this grant's name as its string representation. This allows for
-     * string interpolation when building URL query parameters.
-     *
-     * @return string
+     * @var ScopeRepositoryInterface
      */
-    public function __toString()
+    protected $scopeRepository;
+
+    /**
+     * @var AuthCodeRepositoryInterface
+     */
+    protected $authCodeRepository;
+
+    /**
+     * @var RefreshTokenRepositoryInterface
+     */
+    protected $refreshTokenRepository;
+
+    /**
+     * @var UserRepositoryInterface
+     */
+    protected $userRepository;
+
+    /**
+     * @var DateInterval
+     */
+    protected $refreshTokenTTL;
+
+    /**
+     * @var CryptKey
+     */
+    protected $privateKey;
+
+    /**
+     * @string
+     */
+    protected $defaultScope;
+
+    /**
+     * @param ClientRepositoryInterface $clientRepository
+     */
+    public function setClientRepository(ClientRepositoryInterface $clientRepository)
     {
-        return $this->getName();
+        $this->clientRepository = $clientRepository;
     }
 
     /**
-     * Prepares an access token request's parameters by checking that all
-     * required parameters are set, then merging with any given defaults.
+     * @param AccessTokenRepositoryInterface $accessTokenRepository
+     */
+    public function setAccessTokenRepository(AccessTokenRepositoryInterface $accessTokenRepository)
+    {
+        $this->accessTokenRepository = $accessTokenRepository;
+    }
+
+    /**
+     * @param ScopeRepositoryInterface $scopeRepository
+     */
+    public function setScopeRepository(ScopeRepositoryInterface $scopeRepository)
+    {
+        $this->scopeRepository = $scopeRepository;
+    }
+
+    /**
+     * @param RefreshTokenRepositoryInterface $refreshTokenRepository
+     */
+    public function setRefreshTokenRepository(RefreshTokenRepositoryInterface $refreshTokenRepository)
+    {
+        $this->refreshTokenRepository = $refreshTokenRepository;
+    }
+
+    /**
+     * @param AuthCodeRepositoryInterface $authCodeRepository
+     */
+    public function setAuthCodeRepository(AuthCodeRepositoryInterface $authCodeRepository)
+    {
+        $this->authCodeRepository = $authCodeRepository;
+    }
+
+    /**
+     * @param UserRepositoryInterface $userRepository
+     */
+    public function setUserRepository(UserRepositoryInterface $userRepository)
+    {
+        $this->userRepository = $userRepository;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function setRefreshTokenTTL(DateInterval $refreshTokenTTL)
+    {
+        $this->refreshTokenTTL = $refreshTokenTTL;
+    }
+
+    /**
+     * Set the private key
      *
-     * @param  array $defaults
-     * @param  array $options
+     * @param CryptKey $key
+     */
+    public function setPrivateKey(CryptKey $key)
+    {
+        $this->privateKey = $key;
+    }
+
+    /**
+     * @param string $scope
+     */
+    public function setDefaultScope($scope)
+    {
+        $this->defaultScope = $scope;
+    }
+
+    /**
+     * Validate the client.
+     *
+     * @param ServerRequestInterface $request
+     *
+     * @throws OAuthServerException
+     *
+     * @return ClientEntityInterface
+     */
+    protected function validateClient(ServerRequestInterface $request)
+    {
+        list($basicAuthUser, $basicAuthPassword) = $this->getBasicAuthCredentials($request);
+
+        $clientId = $this->getRequestParameter('client_id', $request, $basicAuthUser);
+        if ($clientId === null) {
+            throw OAuthServerException::invalidRequest('client_id');
+        }
+
+        // If the client is confidential require the client secret
+        $clientSecret = $this->getRequestParameter('client_secret', $request, $basicAuthPassword);
+
+        $client = $this->clientRepository->getClientEntity(
+            $clientId,
+            $this->getIdentifier(),
+            $clientSecret,
+            true
+        );
+
+        if ($client instanceof ClientEntityInterface === false) {
+            $this->getEmitter()->emit(new RequestEvent(RequestEvent::CLIENT_AUTHENTICATION_FAILED, $request));
+            throw OAuthServerException::invalidClient();
+        }
+
+        $redirectUri = $this->getRequestParameter('redirect_uri', $request, null);
+
+        if ($redirectUri !== null) {
+            $this->validateRedirectUri($redirectUri, $client, $request);
+        }
+
+        return $client;
+    }
+
+    /**
+     * Validate redirectUri from the request.
+     * If a redirect URI is provided ensure it matches what is pre-registered
+     *
+     * @param string                 $redirectUri
+     * @param ClientEntityInterface  $client
+     * @param ServerRequestInterface $request
+     *
+     * @throws OAuthServerException
+     */
+    protected function validateRedirectUri(
+        string $redirectUri,
+        ClientEntityInterface $client,
+        ServerRequestInterface $request
+    ) {
+        if (\is_string($client->getRedirectUri())
+            && (strcmp($client->getRedirectUri(), $redirectUri) !== 0)
+        ) {
+            $this->getEmitter()->emit(new RequestEvent(RequestEvent::CLIENT_AUTHENTICATION_FAILED, $request));
+            throw OAuthServerException::invalidClient();
+        } elseif (\is_array($client->getRedirectUri())
+            && \in_array($redirectUri, $client->getRedirectUri(), true) === false
+        ) {
+            $this->getEmitter()->emit(new RequestEvent(RequestEvent::CLIENT_AUTHENTICATION_FAILED, $request));
+            throw OAuthServerException::invalidClient();
+        }
+    }
+
+    /**
+     * Validate scopes in the request.
+     *
+     * @param string|array $scopes
+     * @param string       $redirectUri
+     *
+     * @throws OAuthServerException
+     *
+     * @return ScopeEntityInterface[]
+     */
+    public function validateScopes($scopes, $redirectUri = null)
+    {
+        if (!\is_array($scopes)) {
+            $scopes = $this->convertScopesQueryStringToArray($scopes);
+        }
+
+        $validScopes = [];
+
+        foreach ($scopes as $scopeItem) {
+            $scope = $this->scopeRepository->getScopeEntityByIdentifier($scopeItem);
+
+            if ($scope instanceof ScopeEntityInterface === false) {
+                throw OAuthServerException::invalidScope($scopeItem, $redirectUri);
+            }
+
+            $validScopes[] = $scope;
+        }
+
+        return $validScopes;
+    }
+
+    /**
+     * Converts a scopes query string to an array to easily iterate for validation.
+     *
+     * @param string $scopes
+     *
      * @return array
      */
-    public function prepareRequestParameters(array $defaults, array $options)
+    private function convertScopesQueryStringToArray($scopes)
     {
-        $defaults['grant_type'] = $this->getName();
+        return array_filter(explode(self::SCOPE_DELIMITER_STRING, trim($scopes)), function ($scope) {
+            return !empty($scope);
+        });
+    }
 
-        $required = $this->getRequiredRequestParameters();
-        $provided = array_merge($defaults, $options);
+    /**
+     * Retrieve request parameter.
+     *
+     * @param string                 $parameter
+     * @param ServerRequestInterface $request
+     * @param mixed                  $default
+     *
+     * @return null|string
+     */
+    protected function getRequestParameter($parameter, ServerRequestInterface $request, $default = null)
+    {
+        $requestParameters = (array) $request->getParsedBody();
 
-        $this->checkRequiredParameters($required, $provided);
+        return $requestParameters[$parameter] ?? $default;
+    }
 
-        return $provided;
+    /**
+     * Retrieve HTTP Basic Auth credentials with the Authorization header
+     * of a request. First index of the returned array is the username,
+     * second is the password (so list() will work). If the header does
+     * not exist, or is otherwise an invalid HTTP Basic header, return
+     * [null, null].
+     *
+     * @param ServerRequestInterface $request
+     *
+     * @return string[]|null[]
+     */
+    protected function getBasicAuthCredentials(ServerRequestInterface $request)
+    {
+        if (!$request->hasHeader('Authorization')) {
+            return [null, null];
+        }
+
+        $header = $request->getHeader('Authorization')[0];
+        if (strpos($header, 'Basic ') !== 0) {
+            return [null, null];
+        }
+
+        if (!($decoded = base64_decode(substr($header, 6)))) {
+            return [null, null];
+        }
+
+        if (strpos($decoded, ':') === false) {
+            return [null, null]; // HTTP Basic header without colon isn't valid
+        }
+
+        return explode(':', $decoded, 2);
+    }
+
+    /**
+     * Retrieve query string parameter.
+     *
+     * @param string                 $parameter
+     * @param ServerRequestInterface $request
+     * @param mixed                  $default
+     *
+     * @return null|string
+     */
+    protected function getQueryStringParameter($parameter, ServerRequestInterface $request, $default = null)
+    {
+        return isset($request->getQueryParams()[$parameter]) ? $request->getQueryParams()[$parameter] : $default;
+    }
+
+    /**
+     * Retrieve cookie parameter.
+     *
+     * @param string                 $parameter
+     * @param ServerRequestInterface $request
+     * @param mixed                  $default
+     *
+     * @return null|string
+     */
+    protected function getCookieParameter($parameter, ServerRequestInterface $request, $default = null)
+    {
+        return isset($request->getCookieParams()[$parameter]) ? $request->getCookieParams()[$parameter] : $default;
+    }
+
+    /**
+     * Retrieve server parameter.
+     *
+     * @param string                 $parameter
+     * @param ServerRequestInterface $request
+     * @param mixed                  $default
+     *
+     * @return null|string
+     */
+    protected function getServerParameter($parameter, ServerRequestInterface $request, $default = null)
+    {
+        return isset($request->getServerParams()[$parameter]) ? $request->getServerParams()[$parameter] : $default;
+    }
+
+    /**
+     * Issue an access token.
+     *
+     * @param DateInterval           $accessTokenTTL
+     * @param ClientEntityInterface  $client
+     * @param string|null            $userIdentifier
+     * @param ScopeEntityInterface[] $scopes
+     *
+     * @throws OAuthServerException
+     * @throws UniqueTokenIdentifierConstraintViolationException
+     *
+     * @return AccessTokenEntityInterface
+     */
+    protected function issueAccessToken(
+        DateInterval $accessTokenTTL,
+        ClientEntityInterface $client,
+        $userIdentifier,
+        array $scopes = []
+    ) {
+        $maxGenerationAttempts = self::MAX_RANDOM_TOKEN_GENERATION_ATTEMPTS;
+
+        $accessToken = $this->accessTokenRepository->getNewToken($client, $scopes, $userIdentifier);
+        $accessToken->setClient($client);
+        $accessToken->setUserIdentifier($userIdentifier);
+        $accessToken->setExpiryDateTime((new DateTime())->add($accessTokenTTL));
+
+        foreach ($scopes as $scope) {
+            $accessToken->addScope($scope);
+        }
+
+        while ($maxGenerationAttempts-- > 0) {
+            $accessToken->setIdentifier($this->generateUniqueIdentifier());
+            try {
+                $this->accessTokenRepository->persistNewAccessToken($accessToken);
+
+                return $accessToken;
+            } catch (UniqueTokenIdentifierConstraintViolationException $e) {
+                if ($maxGenerationAttempts === 0) {
+                    throw $e;
+                }
+            }
+        }
+    }
+
+    /**
+     * Issue an auth code.
+     *
+     * @param DateInterval           $authCodeTTL
+     * @param ClientEntityInterface  $client
+     * @param string                 $userIdentifier
+     * @param string|null            $redirectUri
+     * @param ScopeEntityInterface[] $scopes
+     *
+     * @throws OAuthServerException
+     * @throws UniqueTokenIdentifierConstraintViolationException
+     *
+     * @return AuthCodeEntityInterface
+     */
+    protected function issueAuthCode(
+        DateInterval $authCodeTTL,
+        ClientEntityInterface $client,
+        $userIdentifier,
+        $redirectUri,
+        array $scopes = []
+    ) {
+        $maxGenerationAttempts = self::MAX_RANDOM_TOKEN_GENERATION_ATTEMPTS;
+
+        $authCode = $this->authCodeRepository->getNewAuthCode();
+        $authCode->setExpiryDateTime((new DateTime())->add($authCodeTTL));
+        $authCode->setClient($client);
+        $authCode->setUserIdentifier($userIdentifier);
+
+        if ($redirectUri !== null) {
+            $authCode->setRedirectUri($redirectUri);
+        }
+
+        foreach ($scopes as $scope) {
+            $authCode->addScope($scope);
+        }
+
+        while ($maxGenerationAttempts-- > 0) {
+            $authCode->setIdentifier($this->generateUniqueIdentifier());
+            try {
+                $this->authCodeRepository->persistNewAuthCode($authCode);
+
+                return $authCode;
+            } catch (UniqueTokenIdentifierConstraintViolationException $e) {
+                if ($maxGenerationAttempts === 0) {
+                    throw $e;
+                }
+            }
+        }
+    }
+
+    /**
+     * @param AccessTokenEntityInterface $accessToken
+     *
+     * @throws OAuthServerException
+     * @throws UniqueTokenIdentifierConstraintViolationException
+     *
+     * @return RefreshTokenEntityInterface
+     */
+    protected function issueRefreshToken(AccessTokenEntityInterface $accessToken)
+    {
+        $maxGenerationAttempts = self::MAX_RANDOM_TOKEN_GENERATION_ATTEMPTS;
+
+        $refreshToken = $this->refreshTokenRepository->getNewRefreshToken();
+        $refreshToken->setExpiryDateTime((new DateTime())->add($this->refreshTokenTTL));
+        $refreshToken->setAccessToken($accessToken);
+
+        while ($maxGenerationAttempts-- > 0) {
+            $refreshToken->setIdentifier($this->generateUniqueIdentifier());
+            try {
+                $this->refreshTokenRepository->persistNewRefreshToken($refreshToken);
+
+                return $refreshToken;
+            } catch (UniqueTokenIdentifierConstraintViolationException $e) {
+                if ($maxGenerationAttempts === 0) {
+                    throw $e;
+                }
+            }
+        }
+    }
+
+    /**
+     * Generate a new unique identifier.
+     *
+     * @param int $length
+     *
+     * @throws OAuthServerException
+     *
+     * @return string
+     */
+    protected function generateUniqueIdentifier($length = 40)
+    {
+        try {
+            return bin2hex(random_bytes($length));
+            // @codeCoverageIgnoreStart
+        } catch (TypeError $e) {
+            throw OAuthServerException::serverError('An unexpected error has occurred', $e);
+        } catch (Error $e) {
+            throw OAuthServerException::serverError('An unexpected error has occurred', $e);
+        } catch (Exception $e) {
+            // If you get this message, the CSPRNG failed hard.
+            throw OAuthServerException::serverError('Could not generate a random string', $e);
+        }
+        // @codeCoverageIgnoreEnd
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function canRespondToAccessTokenRequest(ServerRequestInterface $request)
+    {
+        $requestParameters = (array) $request->getParsedBody();
+
+        return (
+            array_key_exists('grant_type', $requestParameters)
+            && $requestParameters['grant_type'] === $this->getIdentifier()
+        );
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function canRespondToAuthorizationRequest(ServerRequestInterface $request)
+    {
+        return false;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function validateAuthorizationRequest(ServerRequestInterface $request)
+    {
+        throw new LogicException('This grant cannot validate an authorization request');
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function completeAuthorizationRequest(AuthorizationRequest $authorizationRequest)
+    {
+        throw new LogicException('This grant cannot complete an authorization request');
     }
 }
